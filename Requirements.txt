@@ -1,5 +1,6 @@
 streamlit
+matplotlib
 numpy
 pandas
-matplotlib
 scipy
+plotly
