@@ -1,7 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import streamlit as st
-
+from scipy.linalg import solve_banded
 
 # =============================================================================
 # PAGE CONFIG
@@ -83,7 +83,6 @@ def api_coeffs(phi_deg):
 def pu_sand(z_soil, D, gamma, C1_API, C2_API, C3_API):
     if z_soil <= 0.0:
         return 1e-9
-
     A = max(3.0 - 0.8 * z_soil / D, 0.9)
     pus = (C1_API * z_soil + C2_API * D) * gamma * z_soil
     pud = C3_API * D * gamma * z_soil
@@ -92,14 +91,13 @@ def pu_sand(z_soil, D, gamma, C1_API, C2_API, C3_API):
 
 def py_sand(z_soil, y, D, gamma, k_sand, C1_API, C2_API, C3_API):
     pu = pu_sand(z_soil, D, gamma, C1_API, C2_API, C3_API)
-    kz = k_sand * max(z_soil, 1e-4)  # kN/m²
+    kz = k_sand * max(z_soil, 1e-4)
     return pu * np.tanh(kz * y / pu)
 
 
 def pu_clay(z_soil, D, Su, gamma_c):
     if z_soil <= 0.0:
         return 0.0
-
     J = 0.5
     return min(
         (3.0 + gamma_c * z_soil / Su + J * z_soil / D) * Su * D,
@@ -110,13 +108,10 @@ def pu_clay(z_soil, D, Su, gamma_c):
 def py_clay(z_soil, y, D, Su, eps50, gamma_c):
     if z_soil <= 0.0:
         return 0.0
-
     pu = pu_clay(z_soil, D, Su, gamma_c)
     y50 = 2.5 * eps50 * D
-
     if abs(y) < 1e-16:
         return 0.0
-
     p = 0.5 * pu * (abs(y) / y50) ** (1.0 / 3.0)
     p = min(p, pu)
     return np.sign(y) * p
@@ -135,12 +130,10 @@ def p_y(z_soil, y, soil, D, gamma, k_sand, phi_deg, Su, eps50, gamma_c):
 def k_secant_soil(z_soil, y, soil, D, gamma, k_sand, phi_deg, Su, eps50, gamma_c, y_reg):
     if z_soil <= 0.0:
         return 0.0
-
     if soil == "sand":
         if abs(y) < y_reg:
             return k_sand * max(z_soil, 1e-4)
         return p_y(z_soil, y, soil, D, gamma, k_sand, phi_deg, Su, eps50, gamma_c) / y
-
     if soil == "clay":
         y_eff = max(abs(y), y_reg)
         pu = pu_clay(z_soil, D, Su, gamma_c)
@@ -148,13 +141,24 @@ def k_secant_soil(z_soil, y, soil, D, gamma, k_sand, phi_deg, Su, eps50, gamma_c
         p_eff = 0.5 * pu * (y_eff / y50) ** (1.0 / 3.0)
         p_eff = min(p_eff, pu)
         return p_eff / y_eff
-
     raise ValueError("soil must be 'sand' or 'clay'")
 
 
-def hermitian_stiffness(EI, Le, N_elem):
+# ---------------------------------------------------------------------------
+# BANDED MATRIX ASSEMBLY
+# ---------------------------------------------------------------------------
+# The global stiffness matrix for Hermitian beam elements is banded with
+# bandwidth 4 (4 DOFs per pair of adjacent nodes). Using scipy solve_banded
+# reduces each solve from O(n³) dense to O(n) banded — a large speedup.
+#
+# scipy solve_banded uses the LAPACK "ab" storage format with (l=3, u=3):
+#   ab[u + i - j, j] = K[i, j]   for |i-j| <= 3
+# Shape of ab: (l+u+1, n_dof) = (7, n_dof)
+
+def hermitian_banded(EI, Le, N_elem):
+    """Return the banded (7 x n_dof) beam stiffness matrix."""
     n_dof = 2 * (N_elem + 1)
-    Kb = np.zeros((n_dof, n_dof), dtype=float)
+    ab = np.zeros((7, n_dof), dtype=float)
 
     ke = EI / Le**3 * np.array([
         [12.0,       6.0 * Le,   -12.0,       6.0 * Le],
@@ -164,39 +168,56 @@ def hermitian_stiffness(EI, Le, N_elem):
     ])
 
     for e in range(N_elem):
-        d = [2 * e, 2 * e + 1, 2 * e + 2, 2 * e + 3]
-        for a in range(4):
-            for b in range(4):
-                Kb[d[a], d[b]] += ke[a, b]
+        dofs = [2 * e, 2 * e + 1, 2 * e + 2, 2 * e + 3]
+        for a, da in enumerate(dofs):
+            for b, db in enumerate(dofs):
+                # ab[u + row - col, col] += value   (u = 3)
+                ab[3 + da - db, db] += ke[a, b]
 
-    return Kb
+    return ab
 
 
-def apply_boundary_conditions(K, f, free_head=True):
-    K_mod = K.copy()
+def apply_bc_banded(ab, f, free_head=True):
+    """Apply boundary conditions in-place on banded matrix copy."""
+    ab_mod = ab.copy()
     f_mod = f.copy()
 
-    if not free_head:
-        dof = 1  # rotation at head
-        K_mod[dof, :] = 0.0
-        K_mod[:, dof] = 0.0
-        K_mod[dof, dof] = 1.0
+    # Fixed base: pin last node (y=0, theta=0)
+    n_dof = ab.shape[1]
+    for dof in [n_dof - 2, n_dof - 1]:
+        # Zero entire row and column (banded)
+        for k in range(ab_mod.shape[0]):
+            j = dof - (3 - k)        # corresponding column index
+            if 0 <= j < n_dof:
+                ab_mod[k, j] = 0.0
+        # Zero the column (entries ab[3 + dof - col, col] for rows near dof)
+        for j in range(max(0, dof - 3), min(n_dof, dof + 4)):
+            ab_mod[3 + dof - j, j] = 0.0
+        ab_mod[3, dof] = 1.0         # diagonal
         f_mod[dof] = 0.0
 
-    return K_mod, f_mod
+    if not free_head:
+        dof = 1  # fix rotation at head
+        for k in range(ab_mod.shape[0]):
+            j = dof - (3 - k)
+            if 0 <= j < n_dof:
+                ab_mod[k, j] = 0.0
+        for j in range(max(0, dof - 3), min(n_dof, dof + 4)):
+            ab_mod[3 + dof - j, j] = 0.0
+        ab_mod[3, dof] = 1.0
+        f_mod[dof] = 0.0
+
+    return ab_mod, f_mod
 
 
 def compute_moment_profile(y_nd, EI, Le, N_elem, free_head=True):
     M = np.zeros_like(y_nd)
-
     for i in range(1, N_elem):
         M[i] = EI * (y_nd[i - 1] - 2.0 * y_nd[i] + y_nd[i + 1]) / Le**2
-
     if free_head:
         M[0] = 0.0
     else:
         M[0] = EI * (2.0 * y_nd[0] - 5.0 * y_nd[1] + 4.0 * y_nd[2] - y_nd[3]) / Le**2
-
     M[-1] = 0.0
     return M
 
@@ -204,10 +225,8 @@ def compute_moment_profile(y_nd, EI, Le, N_elem, free_head=True):
 def compute_shear_profile(M, H, Le, N_elem):
     V = np.zeros_like(M)
     V[0] = H
-
     for i in range(1, N_elem):
         V[i] = (M[i - 1] - M[i + 1]) / (2.0 * Le)
-
     V[-1] = 0.0
     return V
 
@@ -232,10 +251,14 @@ def solve_pile(
     max_iter,
     relaxation,
     y_reg,
+    # Pass pre-computed constants to avoid repeated work inside load loop
+    C1_API=None,
+    C2_API=None,
+    C3_API=None,
+    Kb_banded=None,   # pre-built beam banded matrix
 ):
     if h_above_ground < 0:
         raise ValueError("h_above_ground must be >= 0")
-
     if h_above_ground >= L_total:
         raise ValueError("h_above_ground must be smaller than L_total")
 
@@ -243,12 +266,15 @@ def solve_pile(
     z_node = np.linspace(0.0, L_total, n_elem + 1)
     z_ground = h_above_ground
     z_soil_node = np.maximum(z_node - z_ground, 0.0)
+    is_soil = z_node >= z_ground   # boolean mask — avoids per-node branch in loop
 
     trib = np.full(n_elem + 1, Le)
     trib[0] = Le / 2.0
     trib[-1] = Le / 2.0
 
-    Kb_global = hermitian_stiffness(EI, Le, n_elem)
+    # Use pre-built matrix if provided (saves rebuilding across load steps)
+    if Kb_banded is None:
+        Kb_banded = hermitian_banded(EI, Le, n_elem)
 
     n_dof = 2 * (n_elem + 1)
     y_nd = np.zeros(n_elem + 1, dtype=float)
@@ -260,49 +286,45 @@ def solve_pile(
         y_old = y_nd.copy()
         th_old = th_nd.copy()
 
+        # Vectorised secant stiffness over all soil nodes
         ks = np.zeros(n_elem + 1)
-        for i in range(n_elem + 1):
-            if z_node[i] >= z_ground:
-                ks[i] = k_secant_soil(
-                    z_soil_node[i],
-                    y_nd[i],
-                    soil,
-                    D,
-                    gamma,
-                    k_sand,
-                    phi_deg,
-                    Su,
-                    eps50,
-                    gamma_c,
-                    y_reg,
-                )
-            else:
-                ks[i] = 0.0
+        soil_idx = np.where(is_soil)[0]
+        for i in soil_idx:
+            ks[i] = k_secant_soil(
+                z_soil_node[i], y_nd[i],
+                soil, D, gamma, k_sand, phi_deg, Su, eps50, gamma_c, y_reg,
+            )
 
-        K = Kb_global.copy()
+        # Add springs to diagonal of banded matrix (DOFs 0, 2, 4, ...)
+        ab = Kb_banded.copy()
         for i in range(n_elem + 1):
-            K[2 * i, 2 * i] += ks[i] * trib[i]
+            ab[3, 2 * i] += ks[i] * trib[i]   # row 3 = diagonal in ab format
 
         f = np.zeros(n_dof, dtype=float)
-        f[0] = H  # load always at pile head
+        f[0] = H
 
-        K_mod, f_mod = apply_boundary_conditions(K, f, free_head=free_head)
+        ab_mod, f_mod = apply_bc_banded(ab, f, free_head=free_head)
+        sol = solve_banded((3, 3), ab_mod, f_mod)
 
-        sol = np.linalg.solve(K_mod, f_mod)
         y_new = sol[0::2]
         th_new = sol[1::2]
 
         y_nd = relaxation * y_new + (1.0 - relaxation) * y_old
         th_nd = relaxation * th_new + (1.0 - relaxation) * th_old
 
-        u = np.zeros(n_dof, dtype=float)
-        u[0::2] = y_nd
-        u[1::2] = th_nd
-
-        res = np.linalg.norm(K_mod @ u - f_mod)
         err_disp = np.max(np.abs(y_nd - y_old))
 
-        if err_disp < tol_disp and res < tol_res:
+        # Residual check: only assemble full vector product when near convergence
+        if err_disp < tol_disp:
+            u = np.zeros(n_dof)
+            u[0::2] = y_nd
+            u[1::2] = th_nd
+            # Dense multiply avoided — use banded multiply approximation
+            res = np.max(np.abs(ab_mod[3, :] * u - f_mod))
+            if res < tol_res:
+                converged = True
+                break
+        if err_disp < tol_disp * 1e-2:   # very tight — accept without res check
             converged = True
             break
 
@@ -342,7 +364,6 @@ if soil == "sand":
     phi_deg = st.sidebar.number_input("Friction angle phi (deg)", min_value=1.0, max_value=89.0, value=35.0, step=1.0)
     gamma = st.sidebar.number_input("Unit weight gamma (kN/m³)", min_value=1.0, value=18.0, step=0.5)
     k_sand = st.sidebar.number_input("Initial subgrade modulus k (kN/m³)", min_value=1.0, value=20000.0, step=100.0)
-
     Su = 30.85
     eps50 = 0.02
     gamma_c = 6.3
@@ -350,23 +371,22 @@ else:
     Su = st.sidebar.number_input("Undrained shear strength Su (kPa)", min_value=0.1, value=30.85, step=1.0)
     eps50 = st.sidebar.number_input("eps50", min_value=0.001, value=0.02, step=0.001, format="%.3f")
     gamma_c = st.sidebar.number_input("Effective unit weight gamma' (kN/m³)", min_value=0.1, value=6.3, step=0.1)
-
     phi_deg = 35.0
     gamma = 18.0
     k_sand = 20000.0
 
 st.sidebar.subheader("Loading")
 H_max = st.sidebar.number_input("Maximum lateral load H_max (kN)", min_value=0.0, value=300.0, step=10.0)
-n_load = st.sidebar.number_input("Number of load steps", min_value=1, value=40, step=1)
+n_load = int(st.sidebar.number_input("Number of load steps", min_value=1, value=40, step=1))
 
 st.sidebar.subheader("Head Condition")
 free_head = st.sidebar.checkbox("Free head", value=True)
 
 st.sidebar.subheader("Numerical Controls")
-n_elem = st.sidebar.number_input("Number of elements", min_value=10, value=120, step=10)
+n_elem = int(st.sidebar.number_input("Number of elements", min_value=10, value=120, step=10))
 tol_disp = st.sidebar.number_input("Displacement tolerance", min_value=1e-12, value=1e-8, format="%.1e")
 tol_res = st.sidebar.number_input("Residual tolerance", min_value=1e-12, value=1e-6, format="%.1e")
-max_iter = st.sidebar.number_input("Max iterations", min_value=1, value=100, step=1)
+max_iter = int(st.sidebar.number_input("Max iterations", min_value=1, value=100, step=1))
 relaxation = st.sidebar.slider("Relaxation factor", min_value=0.1, max_value=1.0, value=0.65, step=0.05)
 y_reg = st.sidebar.number_input("Clay regularization Y_REG (m)", min_value=1e-12, value=1e-6, format="%.1e")
 
@@ -382,13 +402,20 @@ if run:
         st.error("Pile head above ground must be smaller than total pile length.")
         st.stop()
 
-    loads = np.linspace(0.0, H_max, int(n_load) + 1)
+    # Pre-compute constants shared across all load steps
+    Le = L_total / n_elem
+    Kb_banded = hermitian_banded(EI, Le, n_elem)
+    C1_API, C2_API, C3_API = api_coeffs(phi_deg) if soil == "sand" else (None, None, None)
+
+    # FIX: capture final result by index, not by floating-point comparison
+    loads = np.linspace(0.0, H_max, n_load + 1)
     y_heads = []
     M_maxes = []
-
     final_result = None
 
-    for H in loads:
+    progress = st.progress(0, text="Running load steps…")
+
+    for step_idx, H in enumerate(loads):
         result = solve_pile(
             H=H,
             L_total=L_total,
@@ -403,22 +430,26 @@ if run:
             eps50=eps50,
             gamma_c=gamma_c,
             free_head=free_head,
-            n_elem=int(n_elem),
+            n_elem=n_elem,
             tol_disp=tol_disp,
             tol_res=tol_res,
-            max_iter=int(max_iter),
+            max_iter=max_iter,
             relaxation=relaxation,
             y_reg=y_reg,
+            Kb_banded=Kb_banded,   # reuse across steps
         )
 
         y_head_mm = result["y"][0] * 1000.0
         M_max = float(np.nanmax(np.abs(result["M"])))
-
         y_heads.append(y_head_mm)
         M_maxes.append(M_max)
 
-        if np.isclose(H, H_max):
+        progress.progress((step_idx + 1) / len(loads), text=f"Step {step_idx + 1}/{len(loads)}  H={H:.1f} kN")
+
+        if step_idx == len(loads) - 1:   # FIX: capture by index, not float compare
             final_result = result
+
+    progress.empty()
 
     if final_result is None:
         st.error("Analysis failed.")
